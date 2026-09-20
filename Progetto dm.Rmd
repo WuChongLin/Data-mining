@@ -1,0 +1,399 @@
+---
+title: "Progetto Data mining"
+author: "Wu Chong Lin"
+date: "2026-05-26"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls()); graphics.off(); cat("\014")
+setwd('/Users/ryzen/Desktop/data mining M/progetto/predicting-contraceptive-use-data-mining-clamses')
+
+# Pacchetti
+library(dplyr)
+library(ggplot2)
+library(tictoc)
+library(tidymodels)
+library(tidyverse)
+library(xgboost)
+
+
+# Spaziale
+library(sf) 
+library(spatstat)
+library(stars)
+
+# Dataset
+india <- india1 <- read.csv('training.csv', stringsAsFactors = TRUE)
+
+# Factor
+india <- india %>% mutate(contraceptive = factor(contraceptive, levels = c(0,1), labels = c('no', 'yes')))
+
+# Visualizzazione del dataset
+glimpse(india)
+```
+
+```{r wgs84}
+# lat e log delle regioni indiane prese da: https://simplygis.in/2026/04/13/download-soi-india-state-boundary-shapefile/
+
+india_shp <- st_read("Admin2.shp", quiet = T)
+india.poly <- st_set_crs(india_shp, 4326)
+
+# si prende in considerazione il centroide del di ogni stato/unione territoriale
+centr <- st_centroid(india.poly)
+coord <- st_coordinates(centr) # estrazione delle coordinate 
+centr_coord <- as_tibble(centr$ST_NM)
+centr_coord$log <- coord[,'X']
+centr_coord$lat <- coord[,'Y']
+centr_coord <- centr_coord %>%  filter(!(centr_coord$value %in% c('Andaman & Nicobar', 'Ladakh', 'Lakshadweep', 'Telangana')))
+
+# Ricodifica della nomenclatura degli stati
+centr_coord <- centr_coord %>%
+  mutate(value = if_else(value == "Delhi", 'NCT of Delhi', value)) 
+centr_coord <- centr_coord %>%
+  mutate(value = if_else(value == "Odisha", 'Orissa', value)) 
+centr_coord <- centr_coord %>%
+  mutate(value = if_else(value == "Dadra and Nagar Haveli and Daman and Diu", 'Dadra+Nagar Haveli', value)) 
+centr_coord <- centr_coord %>%
+  mutate(value = if_else(value == "Puducherry", 'Pondicherry', value)) 
+centr_coord[33, 1] <- "Daman & Diu"
+
+# "Daman & Diu" ha le stesse coordinate (rispetto al centroide) di "Dadra+Nagar Haveli"
+centr_coord[33, 2] <- 72.92933
+centr_coord[33, 3] <- 20.24567
+
+# Per ogni stato in cui risiede l'osservazione, si associano le rispettive coordinate
+india <- india %>%
+  left_join(
+    centr_coord, 
+    by = c("state" = "value")
+  )
+```
+
+```{r es}
+# Concentrazione dell'uso/non uso dei contracettivi
+india_yes <- india1 %>% filter(contraceptive == 1) %>%  group_by(state) %>% summarise(n_punti = sum(contraceptive))
+india_yes$state <- NULL
+india_yes <- cbind(india_yes, india1 %>% filter(state != 'Mizoram')  %>%  mutate(contraceptive = if_else(contraceptive == 0, 1, 1)) %>% group_by(state) %>% summarise(n_punti1 = sum(contraceptive), .groups = "drop"))
+india_yes
+
+# modificare Dadra+Nagar Haveli
+india_yes <- india_yes %>%  mutate(n_punti = if_else(state == 'Dadra+Nagar Haveli', (n_punti + india_yes[[8, 2]]), n_punti))
+
+# Ricodifica nomenclatura degli stati indiani
+india.poly <- india.poly %>%
+  mutate(ST_NM = if_else(ST_NM == "Delhi", 'NCT of Delhi', ST_NM))
+india.poly <- india.poly %>%
+  mutate(ST_NM = if_else(ST_NM == "Odisha", 'Orissa', ST_NM)) 
+india.poly <- india.poly %>%
+  mutate(ST_NM = if_else(ST_NM == "Dadra and Nagar Haveli and Daman and Diu", 'Dadra+Nagar Haveli', ST_NM)) 
+india.poly <- india.poly %>%
+  mutate(ST_NM = if_else(ST_NM == "Puducherry", 'Pondicherry', ST_NM)) 
+
+india_yes <- india_yes %>%
+  left_join(
+    centr_coord, 
+    by = c("state" = "value")
+  )
+
+
+
+dati.yes <- merge(india.poly, india_yes, by.y = "state", by.x ="ST_NM", all.x=T)
+st_boundary(india.poly) %>% ggplot() + geom_sf() + 
+  geom_sf(data = dati.yes, aes(fill=n_punti/n_punti1, geometry=geometry)) +
+  scale_fill_continuous(name = "Concetrazione", low="yellow", high="darkgreen", na.value="gray")+ # legenda continua
+    ggspatial::annotation_north_arrow(which_north = "true") +
+    ggspatial::annotation_scale(location="br") 
+```
+
+
+```{r split}
+# Proporzione della classe target
+cat('Proporzione della classe target \n')
+table(india$contraceptive)/nrow(india)
+
+set.seed(123)
+# Split in training e test con split 80/20
+india_idx <- initial_split(india[,-c(1:2)], prop = 0.80, strata = contraceptive)
+india_tr <- training(india_idx)
+india_ts <- testing(india_idx)
+
+table(india_tr$contraceptive)/nrow(india_tr)
+table(india_ts$contraceptive)/nrow(india_ts)
+```
+
+```{r ricetta}
+# Base recipe: dummy-encode factors, remove zero-variance predictors
+base_recipe <- recipe(contraceptive ~ ., data = india_tr) %>% 
+  step_dummy(all_factor_predictors()) %>%
+  step_zv(all_predictors()) 
+
+# Shrinkage methods additionally require centring and scaling
+shrinkage_recipe <- base_recipe %>%
+  step_normalize(all_predictors())
+
+# Metrics
+my_metrics <- metric_set(mn_log_loss)
+
+# CV 10-kfold
+cv_samples <- vfold_cv(india_tr, v = 10)
+```
+
+```{r statistiche descrittive}
+cat('Proporizione classi target \n')
+table(india_tr$contraceptive)/nrow(india_tr)
+
+cat('\n', 'Statistiche descrittive delle covariate', '\n')
+summary(india_tr[,-6])
+
+cat('\n',"Distribuzione delle osservazioni nei vari stati dell'India")
+table(india$state)
+```
+
+```{r glm}
+m_logit <- logistic_reg() %>%
+  set_engine("glm")
+
+set.seed(123)
+wf_full <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(m_logit)
+
+tic()
+
+cv_full <- wf_full %>%
+  fit_resamples(resamples = cv_samples, metrics = my_metrics)
+time_glm <- toc()
+
+collect_metrics(cv_full)
+
+m_full <- wf_full %>% fit(data = india_tr)
+tidy(m_full)
+
+
+```
+
+```{r pcr}
+set.seed(123)
+wf_pcr <- workflow() %>%
+  add_recipe(shrinkage_recipe %>% step_pca(all_predictors(), num_comp = tune())) %>%
+  add_model(m_logit)
+
+tic()
+cv_pcr <- tune_grid(
+  wf_pcr,
+  resamples = cv_samples,
+  grid      = tibble(num_comp = c(1:19, seq(from = 20, to = 90, by = 5))),
+  metrics   = my_metrics,
+  control   = control_grid(save_workflow = TRUE, verbose = TRUE)
+)
+time_pcr <- toc()
+
+collect_metrics(cv_pcr)
+
+autoplot(cv_pcr, metric = "mn_log_loss") + theme_bw()
+show_best(cv_pcr, metric = "mn_log_loss")
+
+best_cv_pcr <- select_best(cv_pcr, metric = "mn_log_loss")
+best_cv_pcr <- finalize_workflow(wf_pcr, best_cv_pcr) %>% fit(data = india_tr)
+
+tidy(best_cv_pcr)
+
+```
+
+```{r ridge}
+set.seed(123)
+lambda_grid <- expand_grid(penalty = exp(seq(-20, 1, length.out = 200)))
+
+wf_ridge <- workflow() %>%
+  add_recipe(shrinkage_recipe) %>%
+  add_model(logistic_reg(penalty = tune(), mixture = 0) %>% set_engine("glmnet"))
+
+tic()
+cv_ridge <- tune_grid(
+  wf_ridge,
+  resamples = cv_samples,
+  grid      = lambda_grid,
+  metrics   = my_metrics
+)
+time_ridge <- toc()
+
+collect_metrics(cv_ridge)
+
+autoplot(cv_ridge, metric = "mn_log_loss") + theme_bw()
+show_best(cv_ridge, metric = "mn_log_loss")
+
+best_cv_ridge <- select_best(cv_ridge, metric = "mn_log_loss")
+best_cv_ridge <- finalize_workflow(wf_ridge, best_cv_ridge) %>% fit(data = india_tr)
+print(tidy(best_cv_ridge), n = 15)
+
+```
+
+```{r lasso}
+set.seed(123)
+lambda_grid <- expand_grid(penalty = exp(seq(-20, 1, length.out = 200)))
+
+wf_lasso <- workflow() %>%
+  add_recipe(shrinkage_recipe) %>%
+  add_model(logistic_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet"))
+
+tic()
+cv_lasso <- tune_grid(
+  wf_lasso,
+  resamples = cv_samples,
+  grid      = lambda_grid,
+  metrics   = my_metrics
+)
+time_lasso <- toc()
+
+collect_metrics(cv_lasso)
+
+autoplot(cv_lasso, metric = "mn_log_loss") + theme_bw()
+show_best(cv_lasso, metric = "mn_log_loss")
+
+best_cv_lasso <- select_best(cv_lasso, metric = "mn_log_loss")
+best_cv_lasso <- finalize_workflow(wf_lasso, best_cv_lasso) %>% fit(data = india_tr)
+
+print(tidy(best_cv_lasso), n = 15)
+tidy(best_cv_lasso) %>% filter(abs(estimate) > 0)
+```
+
+```{r elestic_net}
+set.seed(123)
+lambda_grid <- expand_grid(penalty = exp(seq(-20, 1, length.out = 200)))
+
+wf_en <- workflow() %>%
+  add_recipe(shrinkage_recipe) %>%
+  add_model(logistic_reg(penalty = tune(), mixture = 0.5) %>% set_engine("glmnet"))
+
+tic()
+cv_en <- tune_grid(
+  wf_en,
+  resamples = cv_samples,
+  grid      = lambda_grid,
+  metrics   = my_metrics
+)
+time_en <- toc()
+
+autoplot(cv_en, metric = "mn_log_loss") + theme_bw()
+show_best(cv_en, metric = "mn_log_loss")
+
+best_cv_en <- select_best(cv_en, metric = "mn_log_loss")
+best_cv_en <- finalize_workflow(wf_en, best_cv_en) %>% fit(data = india_tr)
+
+print(tidy(best_cv_en), n = 100)
+tidy(best_cv_en) %>% filter(abs(estimate) > 0)
+```
+
+```{r GAM}
+m_gam <- gen_additive_mod(select_features = FALSE) %>%
+  set_engine("mgcv") %>%
+  set_mode("classification")
+
+base_recipe %>% prep(training = india_tr) %>% bake(new_data = NULL) %>% names()
+
+# GAM: all three predictors as smooth terms + interaction term
+wf_gam_full <- workflow() %>%
+  add_model(m_gam, formula = contraceptive ~ s(age) + child + religion + area +
+              s(log) + s(lat) + education) %>% 
+  add_formula(contraceptive ~ age + child + religion + area + log + 
+                lat + education)
+
+tic()
+cv_gam_full <- wf_gam_full %>%
+  fit_resamples(resamples = cv_samples, metrics = my_metrics)
+collect_metrics(cv_gam_full)
+time_gam <- toc()
+
+m_gam_full <- wf_gam_full %>% fit(data = india_tr)
+```
+
+```{r xgboost}
+xgb_grid_regular <- expand_grid(
+  tree_depth = c(1:8),
+  learn_rate = c(0.001, 0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.075, 0.1),
+  mtry = c(1:12)
+)
+
+set.seed(123)
+xgb_spec <- boost_tree(
+  trees = 5000,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  sample_size = 1/2,
+  mtry = tune(),
+  stop_iter = 10
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification") 
+
+# Assemblaggio del Workflow
+xgb_workflow <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(xgb_spec)
+
+tic()
+xgb_cv <- tune_grid(
+  xgb_workflow,
+  resamples = cv_samples,
+  grid = xgb_grid_regular,
+  metrics = my_metrics
+)
+time_xgb <- toc()
+
+
+autoplot(xgb_cv, metric = "mn_log_loss") + theme_bw()
+show_best(xgb_cv, metric = "mn_log_loss")
+
+best_cv_xgb <- select_best(xgb_cv, metric = "mn_log_loss")
+best_cv_xgb <- finalize_workflow(xgb_workflow, best_cv_xgb) %>% fit(data = india_tr)
+best_cv_xgb
+```
+
+```{r final}
+fitted_models <- list(
+  Full          = m_full,
+  PCR           = best_cv_pcr,
+  Ridge         = best_cv_ridge,
+  Lasso         = best_cv_lasso,
+  `Elastic Net` = best_cv_en,
+  GAM           = m_gam_full,
+  xgb           = best_cv_xgb
+)
+
+results <- imap_dfr(fitted_models, function(model, name) {
+  augment(model, new_data = india_ts) %>%
+    my_metrics(truth = contraceptive, .pred_no) %>%
+    mutate(model = name)
+})
+
+results %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(mn_log_loss)
+```
+
+```{r pred}
+test_fn <- read.csv('test.csv')
+
+test_fn <- test_fn %>%
+  left_join(
+    centr_coord, 
+    by = c("state" = "value")
+  )
+
+table(test_fn$state)
+probs <- augment(best_cv_xgb, new_data = test_fn[,-c(1:2)]) 
+
+probs$ID <- c(1:nrow(probs))
+probs$prediction <- probs$.pred_yes
+
+
+probs[, c(11:12)]
+
+write_csv(probs[, c(11:12)], "prediction.csv")
+```
+
+
